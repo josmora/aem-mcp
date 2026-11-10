@@ -1,0 +1,21 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Logs and coverage
+*.log
+coverage/
+.nyc_output/
+
+# Generated AEM usage reports
+reports/
+
+# Operating system files
+.DS_Store
+Thumbs.db
