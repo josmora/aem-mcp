@@ -19,3 +19,7 @@ reports/
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Local development access tokens
+.secrets/
+aem-local-token*.json

@@ -72,6 +72,54 @@ test('MCP tools read AEM endpoints, authenticate, and reject unsafe paths', asyn
 });
 
 test('configuration requires credentials and a fixed origin', () => {
-  assert.throws(() => new AemClient({}), /Set AEM_TOKEN/);
+  assert.throws(() => new AemClient({}), /Set AEM_TOKEN_FILE/);
   assert.throws(() => new AemClient({ AEM_URL: 'https://example.com/path', AEM_TOKEN: 'test' }), /origin/);
+});
+
+test('cloud requires HTTPS and bearer credentials while local config stays compatible', () => {
+  assert.throws(() => new AemClient({ AEM_ENV: 'other' }), /local or cloud/);
+  assert.throws(() => new AemClient({ AEM_ENV: 'cloud', AEM_TOKEN: 'test' }), /HTTPS/);
+  assert.throws(() => new AemClient({ AEM_ENV: 'cloud', AEM_URL: 'http://example.com', AEM_TOKEN: 'test' }), /HTTPS/);
+  assert.throws(() => new AemClient({ AEM_ENV: 'cloud', AEM_URL: 'https://example.com', AEM_USERNAME: 'admin', AEM_PASSWORD: 'secret' }), /require AEM_TOKEN/);
+  assert.throws(() => new AemClient({ AEM_TOKEN_FILE: 'relative.json' }), /absolute/);
+});
+
+test('cloud reloads JSON and raw tokens per request and fails closed on file errors', async (t) => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'aem-token-test-'));
+  const file = join(dir, 'token.json');
+  const requests = [];
+  let status = 200;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    requests.push({ url: String(url), auth: options.headers.Authorization });
+    return new Response('{}', { status, headers: { 'Content-Type': 'application/json' } });
+  });
+  const client = new AemClient({ AEM_ENV: 'cloud', AEM_URL: 'https://author.example.com', AEM_TOKEN_FILE: file, AEM_TOKEN: 'ignored', AEM_USERNAME: 'admin', AEM_PASSWORD: 'ignored' });
+  try {
+    await assert.rejects(client.read('/content/site', '.json'), /Cannot read AEM_TOKEN_FILE/);
+    assert.equal(requests.length, 0);
+    await writeFile(file, JSON.stringify({ accessToken: 'first-token' }));
+    await client.read('/content/site', '.json');
+    assert.equal(requests.at(-1).auth, 'Bearer first-token');
+    assert.equal(requests.at(-1).url, 'https://author.example.com/content/site.json');
+    status = 401;
+    await assert.rejects(client.read('/content/site', '.json'), /Replace AEM_TOKEN_FILE.*no restart/);
+    status = 200;
+    await writeFile(file, 'second-token\n');
+    await client.query('/content/site', { type: 'cq:Page' });
+    assert.equal(requests.at(-1).auth, 'Bearer second-token');
+    const count = requests.length;
+    for (const invalid of ['', '{bad-json', '{}', '{"accessToken":123}', 'Bearer secret', 'secret\nheader']) {
+      await writeFile(file, invalid);
+      await assert.rejects(client.read('/content/site', '.json'), /Invalid/);
+    }
+    await rm(file);
+    await assert.rejects(client.read('/content/site', '.json'), /Cannot read/);
+    assert.equal(requests.length, count);
+    const staticClient = new AemClient({ AEM_ENV: 'cloud', AEM_URL: 'https://author.example.com', AEM_TOKEN: 'static-token' });
+    await staticClient.read('/content/site', '.json');
+    assert.equal(requests.at(-1).auth, 'Bearer static-token');
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

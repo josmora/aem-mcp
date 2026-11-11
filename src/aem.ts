@@ -1,6 +1,10 @@
+import { readFile } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
+
 export class AemClient {
   private base: URL;
-  private authorization: string;
+  private authorization?: string;
+  private tokenFile?: string;
   private roots: string[];
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -8,11 +12,41 @@ export class AemClient {
     if (!['http:', 'https:'].includes(this.base.protocol) || this.base.username || this.base.password || this.base.pathname !== '/' || this.base.search || this.base.hash) {
       throw new Error('AEM_URL must be an HTTP(S) origin without credentials, path, or query.');
     }
-    if (env.AEM_TOKEN) this.authorization = `Bearer ${env.AEM_TOKEN}`;
+    const environment = env.AEM_ENV || 'local';
+    if (!['local', 'cloud'].includes(environment)) throw new Error('AEM_ENV must be local or cloud.');
+    if (environment === 'cloud' && (!env.AEM_URL || this.base.protocol !== 'https:')) {
+      throw new Error('Cloud environments require an explicit HTTPS AEM_URL.');
+    }
+    if (env.AEM_TOKEN_FILE) {
+      if (!isAbsolute(env.AEM_TOKEN_FILE)) throw new Error('AEM_TOKEN_FILE must be an absolute path.');
+      this.tokenFile = env.AEM_TOKEN_FILE;
+    } else if (env.AEM_TOKEN) this.authorization = `Bearer ${this.validateToken(env.AEM_TOKEN)}`;
+    else if (environment === 'cloud') throw new Error('Cloud environments require AEM_TOKEN_FILE or AEM_TOKEN.');
     else if (env.AEM_USERNAME && env.AEM_PASSWORD) {
       this.authorization = `Basic ${Buffer.from(`${env.AEM_USERNAME}:${env.AEM_PASSWORD}`).toString('base64')}`;
-    } else throw new Error('Set AEM_TOKEN or both AEM_USERNAME and AEM_PASSWORD.');
+    } else throw new Error('Set AEM_TOKEN_FILE, AEM_TOKEN or both AEM_USERNAME and AEM_PASSWORD.');
     this.roots = (env.AEM_ALLOWED_ROOTS || '/content').split(',').map(s => this.validatePath(s.trim()));
+  }
+
+  private validateToken(value: unknown): string {
+    if (typeof value !== 'string' || !value.trim() || !/^[A-Za-z0-9._~+\/=\-]+$/.test(value.trim())) {
+      throw new Error('Invalid access token. Supply a raw token or JSON with an accessToken string.');
+    }
+    return value.trim();
+  }
+
+  private async getAuthorization(): Promise<string> {
+    if (!this.tokenFile) return this.authorization!;
+    let content: string;
+    try { content = await readFile(this.tokenFile, 'utf8'); }
+    catch { throw new Error('Cannot read AEM_TOKEN_FILE. Check that the configured token file exists and is readable.'); }
+    let token: unknown = content.trim();
+    if (content.trimStart().startsWith('{')) {
+      try { token = JSON.parse(content).accessToken; }
+      catch { throw new Error('Invalid JSON in AEM_TOKEN_FILE. Replace it with the downloaded local token JSON.'); }
+    }
+    // Reload every request: replacing a token never requires an MCP restart.
+    return `Bearer ${this.validateToken(token)}`;
   }
 
   private validatePath(path: string): string {
@@ -64,11 +98,16 @@ export class AemClient {
 
   private async request(url: URL): Promise<unknown> {
     const response = await fetch(url, {
-      headers: { Authorization: this.authorization, Accept: 'application/json' },
+      headers: { Authorization: await this.getAuthorization(), Accept: 'application/json' },
       redirect: 'error', signal: AbortSignal.timeout(15000),
     });
     if (!response.ok) {
       await response.body?.cancel();
+      if (response.status === 401 && (this.tokenFile || this.authorization?.startsWith('Bearer '))) {
+        throw new Error(this.tokenFile
+          ? 'AEM returned HTTP 401. The token may be expired or invalid. Replace AEM_TOKEN_FILE with a new local token and retry; no restart is needed.'
+          : 'AEM returned HTTP 401. The token may be expired or invalid. Update AEM_TOKEN and restart the MCP, or use AEM_TOKEN_FILE for rotation without restarting.');
+      }
       throw new Error(`AEM returned HTTP ${response.status}. Check the path, permissions, and credentials.`);
     }
     if (!response.headers.get('content-type')?.includes('json')) {
